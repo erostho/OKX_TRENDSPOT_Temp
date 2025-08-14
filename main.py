@@ -388,8 +388,9 @@ def sheet_clear_data_rows():
             ws = sh.worksheet(SHEET_NAME)
         except gspread.WorksheetNotFound:
             ws = sh.add_worksheet(title=SHEET_NAME, rows=1000, cols=20)
-        # Xóa dữ liệu từ hàng 2, cột A..H (đủ 8 cột chúng ta ghi)
-        ws.batch_clear([ "A2:H" ])
+        # Xóa dữ liệu từ hàng 2, cột A..Z (đủ 8 cột chúng ta ghi)
+        ws.batch_clear([ "A2:Z" ])
+        ws.update("A1:H1", [["Coin","Tín hiệu","Giá","Ngày","Tần suất","Type","Giá Mua dự kiến","Giá Bán dự kiến"]])
         return True
     except Exception as e:
         logging.error(f"[Sheet] clear lỗi: {e}")
@@ -414,7 +415,7 @@ def run_once():
 
     # ===== Google Sheet (8 cột) =====
     sheet_ok = False; sheet_rows = 0
-    CLEAR_SHEET_ON_RUN = int(os.getenv("CLEAR_SHEET_ON_RUN", "0"))
+    # ĐÚNG: dùng biến đã set ở trên
     if CLEAR_SHEET_ON_RUN:
         ok_clear = sheet_clear_data_rows()
         logging.info(f"[Sheet] clear_before_write={ok_clear}")
