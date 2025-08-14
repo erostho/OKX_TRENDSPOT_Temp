@@ -1,565 +1,333 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-main.py — Crypto SPOT trend screener (OKX) + Telegram alert
-
-Logic:
-1) Trend Template (crypto-adjusted Minervini 8 rules, EMA + 180D high/low)
-2) Accumulation filter (VCP-lite via ATR contraction and/or Darvas Box range)
-3) Momentum confirmation (RSI, ADX, Volume, BB width)
-4) Send qualifying coins to Telegram
-
-Environment variables:
-- TELEGRAM_BOT_TOKEN: Telegram bot token
-- TELEGRAM_CHAT_ID: Telegram chat id (group/user)
-- OKX_BASE_URL (optional): default https://www.okx.com
-- MAX_COINS (optional): limit number of spot USDT pairs to scan (default None = all live pairs)
-- TIMEFRAME (optional): kline timeframe, default 1D
-- MIN_USDT_PRICE (optional): filter only coins with last price < this value (e.g., 1.0). Default: no cap
-- MIN_24H_USDT_VOL (optional): minimum 24h quote volume in USDT (default 1_000_000); requires market/tickers call
-- TOP_N (optional): top N to send (by momentum score). Default 30
-
-Run:
-$ python3 main.py
-
-Author: EROS/ChatGPT
+OKX SPOT Trend Screener -> Telegram + Google Sheet (Service Account)
+- 2 chế độ: RELAX_MODE=1 (mặc định), RELAX_MODE=0 (STRICT)
+- Lọc chỉ coin SPOT/USDT có giá < MAX_USDT_PRICE (mặc định 1.0 USDT)
+- Ghi Google Sheet (OKX_BOT / DATA_SPOT) 7 cột: 
+  [Coin, Tín hiệu, Giá, Ngày, Tần suất, Type, Giá Bán dự kiến]
 """
 
-import os
-import sys
-import time
-import math
-import json
-import logging
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple
+import os, re, time, math, logging, requests
+from datetime import datetime, timezone, timedelta
 
-import requests
-
-# ------------------------------ Config ------------------------------
-
-OKX_BASE_URL = os.getenv("OKX_BASE_URL", "https://www.okx.com")
-TIMEFRAME = os.getenv("TIMEFRAME", "1D")  # OKX bars (e.g., 1D, 4H, 1H)
-MAX_COINS = int(os.getenv("MAX_COINS")) if os.getenv("MAX_COINS") else None
-MIN_USDT_PRICE = float(os.getenv("MIN_USDT_PRICE")) if os.getenv("MIN_USDT_PRICE") else None
+# ======== ENV ========
+OKX_BASE_URL = "https://www.okx.com"
+TIMEFRAME = os.getenv("TIMEFRAME", "1D")
+MAX_COINS = int(os.getenv("MAX_COINS", "0")) or None
+MAX_USDT_PRICE = float(os.getenv("MAX_USDT_PRICE", "1.0"))      # chỉ giữ coin < giá này
 MIN_24H_USDT_VOL = float(os.getenv("MIN_24H_USDT_VOL", "1000000"))
 TOP_N = int(os.getenv("TOP_N", "30"))
 
+# Switch chế độ
+RELAX_MODE = int(os.getenv("RELAX_MODE", "1"))  # 1 = RELAX (test rộng), 0 = STRICT
+TYPE_LABEL = "RELAX" if RELAX_MODE else "STRICT"
+
+# Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Trend Template thresholds (crypto adjusted)
-PCT_ABOVE_LOW_WINDOW_DAYS = 180   # replace "52 weeks"
-PCT_ABOVE_LOW_MIN = 0.30          # >= 30% above 180D low
-PCT_BELOW_HIGH_MAX = 0.25         # <= 25% below 180D high
+# Google Sheet (Service Account)
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "").strip()  # VD: /etc/secrets/service_account.json
+SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "").strip()                # dạng /spreadsheets/d/<ID>/edit
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()              # nếu rỗng sẽ auto rút từ SHEET_CSV_URL
+SHEET_NAME = os.getenv("SHEET_NAME", "DATA_SPOT")
+APPEND_FREQ = int(os.getenv("APPEND_FREQ", "60"))                     # phút
+TP_PCT = float(os.getenv("TP_PCT", "0.033"))                          # +3.3% -> cột “Giá Bán dự kiến”
 
-# VCP-lite & Darvas thresholds
-ATR_WINDOW = 20
-ATR_CONTRACTION_LOOKBACK = 30           # lookback to confirm contraction
-ATR_CONTRACTION_RATIO_MAX = 0.08        # ATR20 / close <= 4%
-DARVAS_WINDOW = 15                       # box length
-DARVAS_MAX_WIDTH = 0.10                  # box height relative to price <= 10%
+# ======== Ngưỡng lọc ========
+PCT_ABOVE_LOW_WINDOW_DAYS = 180
+# RELAX
+PCT_ABOVE_LOW_MIN_RELAX  = 0.30
+PCT_BELOW_HIGH_MAX_RELAX = 0.35
+RSI_MIN_RELAX, ADX_MIN_RELAX = 50, 15
+VOL_SPIKE_RELAX, BBW_MAX_RELAX = 1.05, 0.10
+ATR_WIN, ATR_CONTR_LOOKBACK, ATR_NORM_MAX_RELAX = 20, 30, 0.08
+DARVAS_WIN, DARVAS_W_MAX_RELAX = 15, 0.15
+# STRICT
+PCT_ABOVE_LOW_MIN_STRICT  = 0.30
+PCT_BELOW_HIGH_MAX_STRICT = 0.25
+RSI_MIN_STRICT, ADX_MIN_STRICT = 55, 20
+VOL_SPIKE_STRICT, BBW_MAX_STRICT = 1.20, 0.06
+ATR_NORM_MAX_STRICT, DARVAS_W_MAX_STRICT = 0.04, 0.10
 
-# Momentum thresholds
-RSI_MIN = 50                            # RSI >= 55 
-ADX_MIN = 20
-VOL_SPIKE_MULT = 1.2
-BB_WIDTH_MAX = 0.1                      # BB width <= 6% of price
+CANDLE_LIMIT = 300
 
-# Candles
-CANDLE_LIMIT = 300  # enough for EMA200 on daily
-
-
-# ------------------------------ Utilities ------------------------------
-
-def http_get(url: str, params: Dict[str, Any], retries: int = 3, timeout: int = 15) -> Optional[Dict[str, Any]]:
-    for attempt in range(1, retries + 1):
-        try:
-            r = requests.get(url, params=params, timeout=timeout)
-            if r.status_code == 200:
-                return r.json()
-            else:
-                logging.warning(f"GET {url} status={r.status_code} attempt={attempt} params={params}")
-        except Exception as e:
-            logging.warning(f"GET {url} exception={e} attempt={attempt} params={params}")
-        time.sleep(0.8 * attempt)
-    return None
-
-
-def ema(values: List[float], period: int) -> List[float]:
-    if not values or period <= 0:
-        return []
-    k = 2 / (period + 1)
-    res = []
-    ema_prev = None
+# ======== Helpers / Indicators ========
+def ema(values, period):
+    k = 2/(period+1); out, e = [], None
     for v in values:
-        if ema_prev is None:
-            ema_prev = v
-        else:
-            ema_prev = v * k + ema_prev * (1 - k)
-        res.append(ema_prev)
-    return res
-
-
-def sma(values: List[float], period: int) -> List[float]:
-    out = []
-    s = 0.0
-    q = []
-    for v in values:
-        q.append(v)
-        s += v
-        if len(q) > period:
-            s -= q.pop(0)
-        out.append(s / len(q))
+        e = v if e is None else v*k + e*(1-k); out.append(e)
     return out
 
-
-def rsi(values: List[float], period: int = 14) -> List[float]:
-    if len(values) < period + 1:
-        return [math.nan] * len(values)
-    gains = []
-    losses = []
-    for i in range(1, period + 1):
-        ch = values[i] - values[i - 1]
-        gains.append(max(ch, 0))
-        losses.append(max(-ch, 0))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    out = [math.nan] * period
-    if avg_loss == 0:
-        out.append(100.0)
-    else:
-        rs = avg_gain / avg_loss
-        out.append(100 - (100 / (1 + rs)))
-    for i in range(period + 1, len(values)):
-        ch = values[i] - values[i - 1]
-        gain = max(ch, 0)
-        loss = max(-ch, 0)
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-        if avg_loss == 0:
-            out.append(100.0)
-        else:
-            rs = avg_gain / avg_loss
-            out.append(100 - (100 / (1 + rs)))
+def sma(values, period):
+    out, s, q = [], 0.0, []
+    for v in values:
+        q.append(v); s += v
+        if len(q)>period: s -= q.pop(0)
+        out.append(s/len(q))
     return out
 
+def rsi(values, period=14):
+    if len(values) < period+1: return [math.nan]*len(values)
+    gains, losses = [], []
+    for i in range(1, period+1):
+        ch = values[i]-values[i-1]
+        gains.append(max(ch,0)); losses.append(max(-ch,0))
+    ag, al = sum(gains)/period, sum(losses)/period
+    out = [math.nan]*period
+    rs = (ag/al) if al!=0 else math.inf
+    out.append(100 - (100/(1+rs)))
+    for i in range(period+1, len(values)):
+        ch = values[i]-values[i-1]; g, l = max(ch,0), max(-ch,0)
+        ag = (ag*(period-1)+g)/period; al = (al*(period-1)+l)/period
+        rs = (ag/al) if al!=0 else math.inf
+        out.append(100 - (100/(1+rs)))
+    return out
 
-def true_range(h: List[float], l: List[float], c: List[float]) -> List[float]:
-    trs = []
-    prev_close = None
+def true_range(h,l,c):
+    out=[]; pc=None
     for i in range(len(c)):
-        if prev_close is None:
-            tr = h[i] - l[i]
+        tr = (h[i]-l[i]) if pc is None else max(h[i]-l[i], abs(h[i]-pc), abs(l[i]-pc))
+        out.append(tr); pc=c[i]
+    return out
+
+def atr(h,l,c,period=14): return sma(true_range(h,l,c), period)
+
+def adx(h,l,c,period=14):
+    plus_dm=[0.0]; minus_dm=[0.0]
+    for i in range(1,len(h)):
+        up=h[i]-h[i-1]; dn=l[i-1]-l[i]
+        plus_dm.append(max(up,0.0) if up>dn and up>0 else 0.0)
+        minus_dm.append(max(dn,0.0) if dn>up and dn>0 else 0.0)
+    atr_v = atr(h,l,c,period); pd = sma(plus_dm, period); md = sma(minus_dm, period)
+    plus_di=[]; minus_di=[]
+    for i in range(len(c)):
+        if atr_v[i] and atr_v[i]!=0:
+            plus_di.append(100*(pd[i]/atr_v[i])); minus_di.append(100*(md[i]/atr_v[i]))
         else:
-            tr = max(h[i] - l[i], abs(h[i] - prev_close), abs(l[i] - prev_close))
-        trs.append(tr)
-        prev_close = c[i]
-    return trs
+            plus_di.append(math.nan); minus_di.append(math.nan)
+    dx=[]
+    for i in range(len(c)):
+        a,b=plus_di[i],minus_di[i]
+        dx.append(math.nan if (math.isnan(a) or math.isnan(b) or (a+b)==0) else 100*abs(a-b)/(a+b))
+    return sma(dx, period), plus_di, minus_di
 
-
-def atr(high: List[float], low: List[float], close: List[float], period: int = 14) -> List[float]:
-    trs = true_range(high, low, close)
-    return sma(trs, period)
-
-
-def adx(high: List[float], low: List[float], close: List[float], period: int = 14) -> Tuple[List[float], List[float], List[float]]:
-    # Returns: ADX, +DI, -DI
-    if len(close) < period + 2:
-        n = len(close)
-        return [math.nan]*n, [math.nan]*n, [math.nan]*n
-    plus_dm = [0.0]
-    minus_dm = [0.0]
-    for i in range(1, len(high)):
-        up = high[i] - high[i-1]
-        down = low[i-1] - low[i]
-        plus_dm.append(max(up, 0.0) if up > down and up > 0 else 0.0)
-        minus_dm.append(max(down, 0.0) if down > up and down > 0 else 0.0)
-
-    atr_vals = atr(high, low, close, period)
-    plus_di = []
-    minus_di = []
-    for i in range(len(close)):
-        if atr_vals[i] and atr_vals[i] != 0:
-            plus_di.append(100 * (sma(plus_dm, period)[i] / atr_vals[i]))
-            minus_di.append(100 * (sma(minus_dm, period)[i] / atr_vals[i]))
-        else:
-            plus_di.append(math.nan)
-            minus_di.append(math.nan)
-
-    dx = []
-    for i in range(len(close)):
-        if math.isnan(plus_di[i]) or math.isnan(minus_di[i]) or (plus_di[i] + minus_di[i]) == 0:
-            dx.append(math.nan)
-        else:
-            dx.append(100 * abs(plus_di[i] - minus_di[i]) / (plus_di[i] + minus_di[i]))
-
-    adx_vals = sma(dx, period)
-    return adx_vals, plus_di, minus_di
-
-
-def bbands(values: List[float], period: int = 20, std_mult: float = 2.0) -> Tuple[List[float], List[float], List[float], List[float]]:
+def bbands(values, period=20, std_mult=2.0):
     ma = sma(values, period)
-    stds = []
-    from collections import deque
-    dq = deque()
-    s, s2 = 0.0, 0.0
-    for v in values:
-        dq.append(v)
-        s += v
-        s2 += v*v
-        if len(dq) > period:
-            old = dq.popleft()
-            s -= old
-            s2 -= old*old
-        n = len(dq)
-        mean = s / n
-        var = max(s2 / n - mean*mean, 0.0)
-        stds.append(math.sqrt(var))
-    upper = [ma[i] + std_mult * stds[i] for i in range(len(values))]
-    lower = [ma[i] - std_mult * stds[i] for i in range(len(values))]
-    width = [ (upper[i] - lower[i]) / values[i] if values[i] != 0 else math.nan for i in range(len(values)) ]
+    import statistics
+    upper, lower, width = [], [], []
+    for i in range(len(values)):
+        if i<period:
+            upper.append(math.nan); lower.append(math.nan); width.append(math.nan)
+        else:
+            sl = values[i-period+1:i+1]; sd = statistics.pstdev(sl)
+            u = ma[i]+std_mult*sd; d = ma[i]-std_mult*sd
+            upper.append(u); lower.append(d)
+            width.append((u-d)/values[i] if values[i]!=0 else math.nan)
     return ma, upper, lower, width
 
+# ======== OKX API ========
+def okx_get_instruments():
+    r = requests.get(f"{OKX_BASE_URL}/api/v5/public/instruments", params={"instType":"SPOT"}, timeout=20)
+    j = r.json(); return [x for x in j.get("data",[]) if x.get("quoteCcy")=="USDT" and x.get("state")=="live"]
 
-# ------------------------------ OKX API ------------------------------
+def okx_get_tickers():
+    r = requests.get(f"{OKX_BASE_URL}/api/v5/market/tickers", params={"instType":"SPOT"}, timeout=20)
+    j = r.json(); return {x["instId"]:x for x in j.get("data",[])}
 
-def okx_get_instruments_spot_usdt() -> List[Dict[str, Any]]:
-    url = f"{OKX_BASE_URL}/api/v5/public/instruments"
-    data = http_get(url, {"instType": "SPOT"})
-    if not data or data.get("code") != "0":
-        logging.error("Failed to fetch instruments")
-        return []
-    items = data.get("data", [])
-    out = []
-    for it in items:
-        if it.get("quoteCcy") == "USDT" and it.get("state") == "live":
-            out.append(it)
-    return out
+def okx_get_candles(instId, bar, limit=300):
+    r = requests.get(f"{OKX_BASE_URL}/api/v5/market/candles", params={"instId":instId,"bar":bar,"limit":limit}, timeout=20)
+    j = r.json(); return list(reversed(j.get("data",[])))  # oldest-first
 
-
-def okx_get_tickers_spot() -> Dict[str, Dict[str, Any]]:
-    """Return dict instId -> ticker for 24h volume filter and last price."""
-    url = f"{OKX_BASE_URL}/api/v5/market/tickers"
-    data = http_get(url, {"instType": "SPOT"})
-    res = {}
-    if data and data.get("code") == "0":
-        for it in data.get("data", []):
-            res[it["instId"]] = it
-    return res
-
-
-def okx_get_candles(instId: str, bar: str = TIMEFRAME, limit: int = CANDLE_LIMIT) -> Optional[List[List[str]]]:
-    url = f"{OKX_BASE_URL}/api/v5/market/candles"
-    data = http_get(url, {"instId": instId, "bar": bar, "limit": limit})
-    if not data or data.get("code") != "0":
-        return None
-    # OKX returns newest-first, we want oldest-first
-    arr = data.get("data", [])
-    arr = list(reversed(arr))
-    return arr
-
-
-# ------------------------------ Screening Logic ------------------------------
-
-@dataclass
-class CandleData:
-    ts: List[int]
-    open: List[float]
-    high: List[float]
-    low: List[float]
-    close: List[float]
-    vol: List[float]
-    vol_quote: List[float]
-
-
-def parse_okx_candles(raw: List[List[str]]) -> CandleData:
-    # Each item: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
-    ts, o, h, l, c, vol, vol_quote = [], [], [], [], [], [], []
-    for row in raw:
-        ts.append(int(row[0]))
-        o.append(float(row[1]))
-        h.append(float(row[2]))
-        l.append(float(row[3]))
-        c.append(float(row[4]))
-        vol.append(float(row[5]))
-        # OKX sometimes puts quote vol in row[7] (volCcyQuote) or row[6] (volCcy)
-        # We'll try both safely.
-        qv = None
-        try:
-            qv = float(row[7])
-        except Exception:
-            try:
-                qv = float(row[6])
-            except Exception:
-                qv = 0.0
-        vol_quote.append(qv if qv is not None else 0.0)
-    return CandleData(ts, o, h, l, c, vol, vol_quote)
-
-
-def pct(x: float) -> str:
-    return f"{x*100:.1f}%"
-
-
-def trend_template_crypto(c: List[float]) -> Dict[str, bool]:
-    # Requires EMA50/150/200 + 180D high/low proximity
-    ema50 = ema(c, 50)
-    ema150 = ema(c, 150)
-    ema200 = ema(c, 200)
+# ======== Trend/Momentum Filters ========
+def trend_template_relax(c):
+    ema50, ema150, ema200 = ema(c,50), ema(c,150), ema(c,200)
     price = c[-1]
+    if not (price>ema50[-1]>ema150[-1]>ema200[-1]): return False
+    w=min(PCT_ABOVE_LOW_WINDOW_DAYS,len(c)); low=min(c[-w:]); high=max(c[-w:])
+    if low<=0 or high<=0: return False
+    if (price-low)/low < PCT_ABOVE_LOW_MIN_RELAX: return False
+    if (high-price)/high > PCT_BELOW_HIGH_MAX_RELAX: return False
+    return True
 
-    conds = {}
-    conds["close_gt_ema150"] = price > ema150[-1]
-    conds["close_gt_ema200"] = price > ema200[-1]
-    conds["ema150_gt_ema200"] = ema150[-1] > ema200[-1]
+def trend_template_strict(c):
+    ema50, ema150, ema200 = ema(c,50), ema(c,150), ema(c,200)
+    price = c[-1]
+    if not (price>ema50[-1] and price>ema150[-1] and price>ema200[-1]): return False
+    if not (ema50[-1]>ema150[-1]>ema200[-1]): return False
+    if len(ema200)>5 and (ema200[-1]-ema200[-5])<=0: return False  # EMA200 phải dốc lên
+    w=min(PCT_ABOVE_LOW_WINDOW_DAYS,len(c)); low=min(c[-w:]); high=max(c[-w:])
+    if low<=0 or high<=0: return False
+    if (price-low)/low < PCT_ABOVE_LOW_MIN_STRICT: return False
+    if (high-price)/high > PCT_BELOW_HIGH_MAX_STRICT: return False
+    return True
 
-    # slope of EMA200 positive (approx)
-    ema200_slope = ema200[-1] - ema200[-5] if len(ema200) > 5 else 0.0
-    conds["ema200_trending_up"] = ema200_slope > 0
-
-    conds["ema50_stack"] = ema(ema50, 1)[-1] > ema150[-1] and ema50[-1] > ema200[-1]
-    conds["close_gt_ema50"] = price > ema50[-1]
-
-    # 180D high/low
-    w = min(PCT_ABOVE_LOW_WINDOW_DAYS, len(c))
-    win_slice = c[-w:]
-    low_w = min(win_slice)
-    high_w = max(win_slice)
-    conds["pct_above_low"] = (price - low_w) / low_w >= PCT_ABOVE_LOW_MIN if low_w > 0 else False
-    conds["pct_below_high"] = (high_w - price) / high_w <= PCT_BELOW_HIGH_MAX if high_w > 0 else False
-
-    conds["all_ok"] = all(conds.values())
-    return conds
-
-
-def vcp_lite_filter(high: List[float], low: List[float], close: List[float]) -> bool:
-    # ATR contraction and normalized ATR small
-    atr20 = atr(high, low, close, ATR_WINDOW)
-    if len(atr20) < ATR_CONTRACTION_LOOKBACK + 5:
-        return False
-    recent = atr20[-ATR_CONTRACTION_LOOKBACK:]
-    if any(math.isnan(x) for x in recent):
-        return False
-    # slope negative across the window (approx via start-end)
+def vcp_lite(h,l,c, atr_norm_max):
+    a = atr(h,l,c, ATR_WIN)
+    if len(a)<ATR_CONTR_LOOKBACK+5: return False
+    recent = a[-ATR_CONTR_LOOKBACK:]
+    if any(math.isnan(x) for x in recent): return False
     slope = recent[-1] - recent[0]
-    norm = recent[-1] / close[-1] if close[-1] > 0 else 1.0
-    return (slope < 0) and (norm <= ATR_CONTRACTION_RATIO_MAX)
+    norm = recent[-1]/c[-1] if c[-1]>0 else 1.0
+    return (slope<0) and (norm <= atr_norm_max)
 
+def darvas_box(h,l,c, max_width):
+    if len(c)<DARVAS_WIN+2: return False
+    bh, bl = max(h[-DARVAS_WIN:]), min(l[-DARVAS_WIN:])
+    width = (bh-bl)/c[-1] if c[-1]>0 else 1.0
+    broke = c[-1] > bh*1.005  # +0.5% buffer
+    return broke and (width<=max_width)
 
-def darvas_box_filter(high: List[float], low: List[float], close: List[float]) -> Tuple[bool, Optional[float]]:
-    # Use last DARVAS_WINDOW bars as a "box"
-    if len(close) < DARVAS_WINDOW + 2:
-        return False, None
-    box_high = max(high[-DARVAS_WINDOW:])
-    box_low = min(low[-DARVAS_WINDOW:])
-    box_width = (box_high - box_low) / close[-1] if close[-1] > 0 else 1.0
-    # Breakout condition: last close > box_high by small margin
-    broke = close[-1] > box_high * 1.005  # 0.5% buffer
-    tight = box_width <= DARVAS_MAX_WIDTH
-    return (tight and broke), box_high
-
-
-def momentum_confirm(close: List[float], high: List[float], low: List[float], vol: List[float]) -> Dict[str, bool]:
-    rsi_vals = rsi(close, 14)
-    adx_vals, plus_di, minus_di = adx(high, low, close, 14)
-    ma20, bb_u, bb_l, bb_w = bbands(close, 20, 2.0)
-    vol_sma20 = sma(vol, 20)
-    conds = {
-        "rsi": rsi_vals[-1] >= RSI_MIN if not math.isnan(rsi_vals[-1]) else False,
-        "adx": adx_vals[-1] >= ADX_MIN if not math.isnan(adx_vals[-1]) else False,
-        "di": (plus_di[-1] > minus_di[-1]) if not (math.isnan(plus_di[-1]) or math.isnan(minus_di[-1])) else False,
-        "vol_spike": (vol[-1] >= vol_sma20[-1] * VOL_SPIKE_MULT) if vol_sma20[-1] > 0 else False,
-        "bb_width": (bb_w[-1] <= BB_WIDTH_MAX) if not math.isnan(bb_w[-1]) else False
-    }
-    conds["all_ok"] = all(conds.values())
-    return conds
-
-
-def momentum_score(close: List[float], high: List[float], low: List[float], vol: List[float]) -> float:
-    # Simple composite score to rank results
-    rsi_vals = rsi(close, 14)
-    adx_vals, plus_di, minus_di = adx(high, low, close, 14)
-    ma20, bb_u, bb_l, bb_w = bbands(close, 20, 2.0)
-    vol_sma20 = sma(vol, 20)
-    score = 0.0
-    last = -1
-    if not math.isnan(rsi_vals[last]):
-        score += (rsi_vals[last] - 50) / 25  # 0..2 range approx
-    if not math.isnan(adx_vals[last]):
-        score += (adx_vals[last] - 20) / 20  # 0..2
-    if not math.isnan(bb_w[last]) and bb_w[last] > 0:
-        score += max(0.0, (BB_WIDTH_MAX / bb_w[last])) * 0.5  # tighter bands better
-    if vol_sma20[last] > 0:
-        score += min(2.0, vol[last] / vol_sma20[last]) * 0.5
-    return round(score, 3)
-
-
-# ------------------------------ Telegram ------------------------------
-
-def tg_send_message(text: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=20)
-        if r.status_code == 200:
-            return True
-        logging.error(f"Telegram send failed: {r.status_code} {r.text}")
-    except Exception as e:
-        logging.error(f"Telegram send exception: {e}")
-    return False
-
-
-# ------------------------------ Main Flow ------------------------------
-
-def screen_one(instId: str, ticker: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    raw = okx_get_candles(instId, TIMEFRAME, CANDLE_LIMIT)
-    if not raw or len(raw) < 220:  # need enough history for EMA200
-        return None
-    cd = parse_okx_candles(raw)
-    c, h, l, v = cd.close, cd.high, cd.low, cd.vol
-    price = c[-1]
-
-    # Min price cap filter (optional)
-    if MIN_USDT_PRICE is not None and price >= MIN_USDT_PRICE:
-        return None
-
-    # Trend Template
-    tt = trend_template_crypto(c)
-    if not tt["all_ok"]:
-        return None
-
-    # Accumulation: VCP-lite or Darvas box
-    vcp_ok = vcp_lite_filter(h, l, c)
-    darvas_ok, box_high = darvas_box_filter(h, l, c)
-    if not (vcp_ok or darvas_ok):
-        return None
-
-    # Momentum
-    mom = momentum_confirm(c, h, l, v)
-    if not mom["all_ok"]:
-        return None
-
-    score = momentum_score(c, h, l, v)
-
-    # Distance to 180D high/low
-    w = min(PCT_ABOVE_LOW_WINDOW_DAYS, len(c))
-    win = c[-w:]
-    low_w = min(win)
-    high_w = max(win)
-    pct_above_low = (price - low_w) / low_w if low_w > 0 else 0.0
-    pct_below_high = (high_w - price) / high_w if high_w > 0 else 0.0
-
-    # 24h volume filter (quote)
-    vol_q = 0.0
-    if ticker:
-        # OKX provides 'volCcy24h' as base or quote depending; try both safe
-        for key in ("volCcy24h", "vol24h", "volCcyQuote", "volCcy"):
-            if key in ticker and ticker[key] not in (None, "", "0"):
-                try:
-                    vol_q = float(ticker[key])
-                    break
-                except:
-                    pass
-    # Filter by 24h quote volume (USDT) if available
-    if vol_q and vol_q < MIN_24H_USDT_VOL:
-        return None
-
-    return {
-        "instId": instId,
-        "price": price,
-        "score": score,
-        "pct_above_low": pct_above_low,
-        "pct_below_high": pct_below_high,
-        "vcp_ok": vcp_ok,
-        "darvas_ok": darvas_ok,
-        "box_high": box_high,
-        "vol_q_24h": vol_q,
-    }
-
-
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    logging.info("Fetching SPOT USDT instruments from OKX...")
-    instruments = okx_get_instruments_spot_usdt()
-    if not instruments:
-        logging.error("No instruments fetched.")
-        sys.exit(1)
-
-    # Reduce to live USDT pairs and optionally cap count
-    inst_ids = [it["instId"] for it in instruments if it.get("quoteCcy") == "USDT" and it.get("state") == "live"]
-    if MAX_COINS:
-        inst_ids = inst_ids[:MAX_COINS]
-
-    logging.info(f"Total SPOT USDT pairs to scan: {len(inst_ids)}")
-
-    tickers = okx_get_tickers_spot()
-
-    results = []
-    for i, instId in enumerate(inst_ids, 1):
-        if i % 25 == 0:
-            logging.info(f"Scanning {i}/{len(inst_ids)}...")
-        ticker = tickers.get(instId, {})
-        try:
-            res = screen_one(instId, ticker)
-            if res:
-                results.append(res)
-        except Exception as e:
-            logging.warning(f"screen_one error for {instId}: {e}")
-
-        time.sleep(0.05)  # gentle pacing
-
-    if not results:
-        msg = "🔍 Không có coin SPOT nào đạt bộ lọc Trend+VCP+Momentum ở thời điểm quét."
-        logging.info(msg)
-        tg_send_message(msg)
-        return
-
-    # Rank by score then by pct_below_high ascending (closer to high first)
-    results.sort(key=lambda x: (-x["score"], x["pct_below_high"]))
-
-    # Prepare Telegram message
-    header = "🚀 <b>SPOT Trend Screener (OKX)</b>\n"
-    header += f"Khung: <b>{TIMEFRAME}</b> | Quy tắc: Trend Template + VCP/Darvas + Momentum\n"
-    header += f"Điều kiện: RSI≥{RSI_MIN}, ADX≥{ADX_MIN}, BBW≤{int(BB_WIDTH_MAX*100)}%, Vol≥{VOL_SPIKE_MULT}×MA20\n"
-    lines = [header]
-
-    for idx, r in enumerate(results[:TOP_N], 1):
-        name = r["instId"].replace("-", "/")
-        tags = []
-        if r["vcp_ok"]: tags.append("VCP")
-        if r["darvas_ok"]: tags.append("Darvas")
-        tag_txt = ",".join(tags) if tags else "—"
-        line = (
-            f"{idx:02d}. <b>{name}</b> @ <code>{r['price']:.6g}</code> "
-            f"| Score <b>{r['score']:.2f}</b> "
-            f"| ↑low180 {pct(r['pct_above_low'])} | ↓high180 {pct(r['pct_below_high'])} "
-            f"| {tag_txt}"
-        )
-        lines.append(line)
-
-    text = "\n".join(lines)
-    sent = tg_send_message(text)
-    if sent:
-        logging.info("Telegram message sent.")
+def momentum(c,h,l,v, *, strict=False):
+    rsi_v = rsi(c,14)[-1]
+    adx_v, pdi, mdi = adx(h,l,c,14)
+    adx_last = adx_v[-1]
+    _,_,_, bbw = bbands(c,20,2.0)
+    vol_ma20 = sma(v,20)
+    if strict:
+        return (rsi_v>=RSI_MIN_STRICT and adx_last>=ADX_MIN_STRICT and
+                (pdi[-1]>mdi[-1]) and
+                (vol_ma20[-1]>0 and v[-1]>=vol_ma20[-1]*VOL_SPIKE_STRICT) and
+                (not math.isnan(bbw[-1]) and bbw[-1]<=BBW_MAX_STRICT))
     else:
-        logging.error("Failed to send Telegram message.")
+        conds = [
+            rsi_v>=RSI_MIN_RELAX,
+            adx_last>=ADX_MIN_RELAX,
+            (pdi[-1]>mdi[-1]),
+            (vol_ma20[-1]>0 and v[-1]>=vol_ma20[-1]*VOL_SPIKE_RELAX),
+            (not math.isnan(bbw[-1]) and bbw[-1]<=BBW_MAX_RELAX)
+        ]
+        return sum(conds)>=3
 
-
-if __name__ == "__main__":
+# ======== Telegram ========
+def tg_send(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.error("Missing TELEGRAM_BOT_TOKEN/CHAT_ID"); return False
+    url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload={"chat_id":TELEGRAM_CHAT_ID,"text":text,"parse_mode":"HTML","disable_web_page_preview":True}
     try:
-        main()
+        r=requests.post(url,json=payload,timeout=20)
+        return r.status_code==200
+    except Exception as e:
+        logging.error(f"Telegram exception: {e}")
+        return False
+
+# ======== Google Sheet (Service Account) ========
+import gspread
+from google.oauth2.service_account import Credentials
+def extract_spreadsheet_id(sheet_csv_url: str) -> str:
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)/", sheet_csv_url or "")
+    return m.group(1) if m else ""
+
+if not SPREADSHEET_ID and SHEET_CSV_URL:
+    SPREADSHEET_ID = extract_spreadsheet_id(SHEET_CSV_URL)
+
+def sheet_append_rows_service(rows):
+    if not SERVICE_ACCOUNT_FILE:
+        logging.warning("SERVICE_ACCOUNT_FILE chưa cấu hình."); return False
+    if not SPREADSHEET_ID:
+        logging.warning("SPREADSHEET_ID rỗng (không rút được từ SHEET_CSV_URL)."); return False
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    try:
+        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        try:
+            ws = sh.worksheet(SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=SHEET_NAME, rows=1000, cols=20)
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
+        return True
+    except Exception as e:
+        logging.error(f"[Sheet] append lỗi: {e}")
+        return False
+
+# ====
+# ======== Screening ========
+def screen_market():
+    insts = okx_get_instruments()
+    if MAX_COINS: insts = insts[:MAX_COINS]
+    tickers = okx_get_tickers()
+
+    logging.info(f"Pairs: {len(insts)} | Mode: {TYPE_LABEL} | TF: {TIMEFRAME}")
+
+    results=[]
+    for it in insts:
+        instId = it["instId"]
+        tk = tickers.get(instId, {})
+        # Giá hiện tại
+        try: price = float(tk.get("last","0") or 0)
+        except: price = 0.0
+        if price<=0 or price>=MAX_USDT_PRICE:
+            continue
+        # 24h quote volume
+        vol_q=0.0
+        for key in ("volCcy24h","vol24h","volCcyQuote","volCcy"):
+            if key in tk and tk[key] not in (None,"","0"):
+                try: vol_q=float(tk[key]); break
+                except: pass
+        if vol_q < MIN_24H_USDT_VOL:
+            continue
+
+        # Candles
+        raw = okx_get_candles(instId, TIMEFRAME, CANDLE_LIMIT)
+        if not raw or len(raw)<220:
+            continue
+        h,l,c,v=[],[],[],[]
+        for row in raw:
+            h.append(float(row[2])); l.append(float(row[3])); c.append(float(row[4])); v.append(float(row[5]))
+
+        # Trend + Momentum (+ VCP/Darvas nếu STRICT)
+        if RELAX_MODE:
+            if not trend_template_relax(c): 
+                continue
+            if not momentum(c,h,l,v, strict=False):
+                continue
+        else:
+            if not trend_template_strict(c):
+                continue
+            mom_ok = momentum(c,h,l,v, strict=True)
+            vcp_ok = vcp_lite(h,l,c, ATR_NORM_MAX_STRICT)
+            darvas_ok = darvas_box(h,l,c, DARVAS_W_MAX_STRICT)
+            if not (mom_ok and (vcp_ok or darvas_ok)):
+                continue
+
+        results.append({"instId":instId, "price":price})
+        time.sleep(0.04)  # nhẹ nhàng gọi API
+
+    return results
+
+def run_once():
+    results = screen_market()
+
+    # ===== Telegram =====
+    if not results:
+        tg_send(f"Không có coin SPOT <{MAX_USDT_PRICE}$ đạt lọc {TYPE_LABEL}.")
+    else:
+        head = f"🚀 <b>SPOT Trend {TYPE_LABEL} (&lt;{MAX_USDT_PRICE}$)</b>\n"
+        lines = [f"{i:02d}. {r['instId']} @ {r['price']:.6g}" for i,r in enumerate(results[:TOP_N],1)]
+        tg_send(head + "\n".join(lines))
+
+    # ===== Google Sheet (7 cột) =====
+    if results and SERVICE_ACCOUNT_FILE:
+        now_vn = datetime.now(timezone.utc) + timedelta(hours=7)
+        now_str = now_vn.strftime("%Y-%m-%d %H:%M:%S")
+        rows=[]
+        for r in results[:TOP_N]:
+            coin = r["instId"]; price = r["price"]; tp_price = price*(1.0+TP_PCT)
+            rows.append([coin, "MUA MẠNH", price, now_str, APPEND_FREQ, TYPE_LABEL, round(tp_price, 10)])
+        ok = sheet_append_rows_service(rows)
+        if ok: logging.info(f"Đã append {len(rows)} dòng vào Google Sheet: {SHEET_NAME}")
+        else:  logging.warning("Append Google Sheet thất bại.")
+
+# ======== Entry ========
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    try:
+        run_once()
     except KeyboardInterrupt:
-        print("Interrupted by user")
+        pass
