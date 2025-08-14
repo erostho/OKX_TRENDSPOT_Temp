@@ -39,7 +39,7 @@ SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "/etc/secrets/service_a
 SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "").strip()                # /spreadsheets/d/<ID>/edit
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
 SHEET_NAME = os.getenv("SHEET_NAME", "DATA_SPOT")
-APPEND_FREQ = int(os.getenv("APPEND_FREQ", "60"))                     # phút
+APPEND_FREQ = int(os.getenv("APPEND_FREQ", "90"))                     # phút
 TP_PCT = float(os.getenv("TP_PCT", "0.2"))                          # +20%
 # ENTRY_MODE: 'MARKET' = mua theo giá hiện tại; 'PULLBACK' = đặt mua thấp hơn X%
 ENTRY_MODE = os.getenv("ENTRY_MODE", "MARKET").upper()       # MARKET | PULLBACK
