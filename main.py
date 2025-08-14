@@ -4,7 +4,7 @@
 OKX SPOT Trend Screener -> Telegram + Google Sheet (Service Account)
 - 2 chế độ: RELAX_MODE=1 (mặc định), RELAX_MODE=0 (STRICT)
 - Lọc coin SPOT/USDT giá < MAX_USDT_PRICE (mặc định 1.0 USDT)
-- Ghi Google Sheet 7 cột: [Coin, Tín hiệu, Giá, Ngày, Tần suất, Type, Giá Bán dự kiến]
+- Ghi Google Sheet 8 cột: [Coin, Tín hiệu, Giá, Ngày, Tần suất, Type, Giá Mua dự kiến, Giá Bán dự kiến]
 - DEBUG chi tiết:
   * DEBUG=0: log gọn
   * DEBUG=1: log tiến độ, coin pass từng bước, tổng kết
@@ -44,6 +44,8 @@ TP_PCT = float(os.getenv("TP_PCT", "0.2"))                          # +20%
 # ENTRY_MODE: 'MARKET' = mua theo giá hiện tại; 'PULLBACK' = đặt mua thấp hơn X%
 ENTRY_MODE = os.getenv("ENTRY_MODE", "MARKET").upper()       # MARKET | PULLBACK
 ENTRY_DISCOUNT_PCT = float(os.getenv("ENTRY_DISCOUNT_PCT", "0.0"))  # ví dụ 0.005 = -0.5%
+CLEAR_SHEET_ON_RUN=1   # 1 = xóa dữ liệu cũ trước khi ghi, 0 = append như hiện tại
+
 # ======== Ngưỡng lọc ========
 PCT_ABOVE_LOW_WINDOW_DAYS = 180
 # RELAX
@@ -363,6 +365,29 @@ def screen_market():
 
     return results
 
+def sheet_clear_data_rows():
+    """Xóa dữ liệu (giữ hàng 1 là tiêu đề) trong vùng A2:H."""
+    if not SERVICE_ACCOUNT_FILE or not SPREADSHEET_ID:
+        return False
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    try:
+        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        try:
+            ws = sh.worksheet(SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=SHEET_NAME, rows=1000, cols=20)
+        # Xóa dữ liệu từ hàng 2, cột A..H (đủ 8 cột chúng ta ghi)
+        ws.batch_clear([ "A2:H" ])
+        return True
+    except Exception as e:
+        logging.error(f"[Sheet] clear lỗi: {e}")
+        return False
+
 # ======== Orchestrate ========
 def run_once():
     results = screen_market()
@@ -382,22 +407,38 @@ def run_once():
 
     # ===== Google Sheet (8 cột) =====
     sheet_ok = False; sheet_rows = 0
+    CLEAR_SHEET_ON_RUN = int(os.getenv("CLEAR_SHEET_ON_RUN", "0"))
+    if CLEAR_SHEET_ON_RUN:
+        ok_clear = sheet_clear_data_rows()
+        logging.info(f"[Sheet] clear_before_write={ok_clear}")
     if results and SERVICE_ACCOUNT_FILE:
         now_vn = datetime.now(timezone.utc) + timedelta(hours=7)
         now_str = now_vn.strftime("%Y-%m-%d %H:%M:%S")
+        
         rows = []
         for r in results[:TOP_N]:
-            coin = r["instId"]
+            coin  = r["instId"]
             price = r["price"]
         
-            # Giá Mua dự kiến (entry)
-            entry_price = price  # nếu muốn mua ngay giá hiện tại
-            # entry_price = price * 0.995  # ví dụ mua thấp hơn 0.5%
+            # --- Entry (Giá Mua dự kiến) ---
+            mode = ENTRY_MODE
+            if mode == "PULLBACK_PCT":
+                entry_price = price * (1.0 - ENTRY_DISCOUNT_PCT)
+            elif mode == "RETEST_EMA20":
+                entry_price = r.get("ema20", price)
+            elif mode == "BB_MID":
+                entry_price = r.get("bb_mid", price)
+            elif mode == "BREAKOUT":
+                rh = r.get("recent_high", price)
+                entry_price = rh * (1.0 + ENTRY_BREAKOUT_BUF_PCT)
+            else:  # MARKET
+                entry_price = price
         
-            # Giá Bán dự kiến (tính từ entry)
+            # --- TP (Giá Bán dự kiến) ---
+            # Nếu bạn muốn theo %: TP_PCT (đang có sẵn trong ENV)
             tp_price = entry_price * (1.0 + TP_PCT)
+            # Nếu muốn theo ATR ở tương lai: tp_price = entry_price + r.get("atr20", 0) * TP_ATR_MULT
         
-            # Ghi 8 cột
             rows.append([
                 coin, "MUA MẠNH", price, now_str,
                 APPEND_FREQ, TYPE_LABEL,
