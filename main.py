@@ -39,7 +39,7 @@ SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "/etc/secrets/service_a
 SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "").strip()                # /spreadsheets/d/<ID>/edit
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
 SHEET_NAME = os.getenv("SHEET_NAME", "DATA_SPOT")
-APPEND_FREQ = int(os.getenv("APPEND_FREQ", "90"))                     # phút
+APPEND_FREQ = int(os.getenv("APPEND_FREQ", "60"))                     # phút
 TP_PCT = float(os.getenv("TP_PCT", "0.2"))                          # +20%
 CLEAR_SHEET_ON_RUN=1   # 1 = xóa dữ liệu cũ trước khi ghi, 0 = append như hiện tại
 
