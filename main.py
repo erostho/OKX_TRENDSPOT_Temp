@@ -35,7 +35,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # Google Sheet (Service Account)
-SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "").strip()  # /etc/secrets/service_account.json
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "/etc/secrets/service_account.json").strip()  # /etc/secrets/service_account.json
 SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "").strip()                # /spreadsheets/d/<ID>/edit
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
 SHEET_NAME = os.getenv("SHEET_NAME", "DATA_SPOT")
