@@ -11,7 +11,7 @@ OKX SPOT Trend Screener -> Telegram + Google Sheet (Service Account)
   * DEBUG=2: log cả lý do loại cho từng coin
   * LOG_EVERY=k: cứ k coin in 1 dòng tiến độ (mặc định 25)
 """
-
+from datetime import datetime, timedelta
 import os, re, time, math, logging, requests
 from datetime import datetime, timezone, timedelta
 
@@ -372,14 +372,17 @@ def screen_market():
 
     return results
 
+
 def sheet_clear_data_rows():
-    """Xóa dữ liệu (giữ hàng 1 là tiêu đề) trong vùng A2:H."""
+    """Xóa dữ liệu (giữ hàng 1 là tiêu đề) trong vùng A2:H nếu đã quá 1 ngày."""
     if not SERVICE_ACCOUNT_FILE or not SPREADSHEET_ID:
         return False
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
+
     try:
         creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
         gc = gspread.authorize(creds)
@@ -388,10 +391,23 @@ def sheet_clear_data_rows():
             ws = sh.worksheet(SHEET_NAME)
         except gspread.WorksheetNotFound:
             ws = sh.add_worksheet(title=SHEET_NAME, rows=1000, cols=20)
-        # Xóa dữ liệu từ hàng 2, cột A..Z (đủ 8 cột chúng ta ghi)
-        ws.batch_clear([ "A2:Z" ])
+
+        # Lấy giá trị ngày ở cột D (hoặc cột bạn lưu ngày)
+        dates = ws.col_values(4)[1:]  # bỏ dòng tiêu đề
+        if dates:
+            # Chuyển chuỗi ngày về datetime
+            last_date_str = dates[-1]
+            last_date = datetime.strptime(last_date_str, "%Y-%m-%d")
+            if datetime.now() - last_date < timedelta(days=1):
+                logging.info("❌ Dữ liệu chưa quá 1 ngày -> Không xoá")
+                return False
+
+        # Xóa dữ liệu nếu đã quá 1 ngày
+        ws.batch_clear(["A2:Z"])
         ws.update("A1:H1", [["Coin","Tín hiệu","Giá","Ngày","Tần suất","Type","Giá Mua dự kiến","Giá Bán dự kiến"]])
+        logging.info("✅ Đã xoá dữ liệu vì quá 1 ngày")
         return True
+
     except Exception as e:
         logging.error(f"[Sheet] clear lỗi: {e}")
         return False
