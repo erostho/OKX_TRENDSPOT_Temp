@@ -40,8 +40,10 @@ SHEET_CSV_URL = os.getenv("SHEET_CSV_URL", "").strip()                # /spreads
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
 SHEET_NAME = os.getenv("SHEET_NAME", "DATA_SPOT")
 APPEND_FREQ = int(os.getenv("APPEND_FREQ", "60"))                     # phút
-TP_PCT = float(os.getenv("TP_PCT", "0.033"))                          # +3.3%
-
+TP_PCT = float(os.getenv("TP_PCT", "0.2"))                          # +20%
+# ENTRY_MODE: 'MARKET' = mua theo giá hiện tại; 'PULLBACK' = đặt mua thấp hơn X%
+ENTRY_MODE = os.getenv("ENTRY_MODE", "MARKET").upper()       # MARKET | PULLBACK
+ENTRY_DISCOUNT_PCT = float(os.getenv("ENTRY_DISCOUNT_PCT", "0.0"))  # ví dụ 0.005 = -0.5%
 # ======== Ngưỡng lọc ========
 PCT_ABOVE_LOW_WINDOW_DAYS = 180
 # RELAX
@@ -378,15 +380,30 @@ def run_once():
         sent_count = min(len(results), TOP_N)
         logging.info(f"Telegram sent={sent} | rows={sent_count}")
 
-    # ===== Google Sheet (7 cột) =====
+    # ===== Google Sheet (8 cột) =====
     sheet_ok = False; sheet_rows = 0
     if results and SERVICE_ACCOUNT_FILE:
         now_vn = datetime.now(timezone.utc) + timedelta(hours=7)
         now_str = now_vn.strftime("%Y-%m-%d %H:%M:%S")
-        rows=[]
+        rows = []
         for r in results[:TOP_N]:
-            coin = r["instId"]; price = r["price"]; tp_price = price*(1.0+TP_PCT)
-            rows.append([coin, "MUA MẠNH", price, now_str, APPEND_FREQ, TYPE_LABEL, round(tp_price, 10)])
+            coin = r["instId"]
+            price = r["price"]
+        
+            # Giá Mua dự kiến (entry)
+            entry_price = price  # nếu muốn mua ngay giá hiện tại
+            # entry_price = price * 0.995  # ví dụ mua thấp hơn 0.5%
+        
+            # Giá Bán dự kiến (tính từ entry)
+            tp_price = entry_price * (1.0 + TP_PCT)
+        
+            # Ghi 8 cột
+            rows.append([
+                coin, "MUA MẠNH", price, now_str,
+                APPEND_FREQ, TYPE_LABEL,
+                round(entry_price, 10), round(tp_price, 10)
+            ])
+        
         sheet_ok = sheet_append_rows_service(rows)
         sheet_rows = len(rows) if sheet_ok else 0
         logging.info(f"Sheet append ok={sheet_ok} | rows={sheet_rows} | sheet={SHEET_NAME}")
