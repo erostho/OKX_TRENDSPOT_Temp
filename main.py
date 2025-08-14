@@ -41,10 +41,16 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
 SHEET_NAME = os.getenv("SHEET_NAME", "DATA_SPOT")
 APPEND_FREQ = int(os.getenv("APPEND_FREQ", "90"))                     # phút
 TP_PCT = float(os.getenv("TP_PCT", "0.2"))                          # +20%
-# ENTRY_MODE: 'MARKET' = mua theo giá hiện tại; 'PULLBACK' = đặt mua thấp hơn X%
-ENTRY_MODE = os.getenv("ENTRY_MODE", "MARKET").upper()       # MARKET | PULLBACK
-ENTRY_DISCOUNT_PCT = float(os.getenv("ENTRY_DISCOUNT_PCT", "0.0"))  # ví dụ 0.005 = -0.5%
 CLEAR_SHEET_ON_RUN=1   # 1 = xóa dữ liệu cũ trước khi ghi, 0 = append như hiện tại
+ENTRY_MODE = PULLBACK_PCT          # chờ hồi X% rồi mua
+ENTRY_DISCOUNT_PCT=0.02          # 2% nếu dùng PULLBACK_PCT
+
+# ENTRY_MODE=MARKET          # mua ngay giá hiện tại
+# ENTRY_MODE=RETEST_EMA20    # mua tại EMA20
+# ENTRY_MODE=BB_MID          # mua tại SMA20 (mid Bollinger)
+# ENTRY_MODE=BREAKOUT        # mua khi vượt đỉnh N nến + buffer
+ENTRY_BREAKOUT_LOOKBACK=10         # N nến nếu dùng BREAKOUT
+ENTRY_BREAKOUT_BUF_PCT=0.005       # +0.5% trên đỉnh nếu dùng BREAKOUT
 
 # ======== Ngưỡng lọc ========
 PCT_ABOVE_LOW_WINDOW_DAYS = 180
