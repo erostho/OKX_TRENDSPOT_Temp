@@ -42,7 +42,7 @@ SHEET_NAME = os.getenv("SHEET_NAME", "DATA_SPOT")
 APPEND_FREQ = int(os.getenv("APPEND_FREQ", "90"))                     # phút
 TP_PCT = float(os.getenv("TP_PCT", "0.2"))                          # +20%
 CLEAR_SHEET_ON_RUN=1   # 1 = xóa dữ liệu cũ trước khi ghi, 0 = append như hiện tại
-ENTRY_MODE = PULLBACK_PCT          # chờ hồi X% rồi mua
+ENTRY_MODE = "PULLBACK_PCT"          # chờ hồi X% rồi mua
 ENTRY_DISCOUNT_PCT=0.02          # 2% nếu dùng PULLBACK_PCT
 
 # ENTRY_MODE=MARKET          # mua ngay giá hiện tại
