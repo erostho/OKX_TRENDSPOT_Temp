@@ -57,15 +57,15 @@ PCT_BELOW_HIGH_MAX = 0.25         # <= 25% below 180D high
 # VCP-lite & Darvas thresholds
 ATR_WINDOW = 20
 ATR_CONTRACTION_LOOKBACK = 30           # lookback to confirm contraction
-ATR_CONTRACTION_RATIO_MAX = 0.04        # ATR20 / close <= 4%
+ATR_CONTRACTION_RATIO_MAX = 0.08        # ATR20 / close <= 4%
 DARVAS_WINDOW = 15                       # box length
 DARVAS_MAX_WIDTH = 0.10                  # box height relative to price <= 10%
 
 # Momentum thresholds
-RSI_MIN = 55
+RSI_MIN = 50                            # RSI >= 55 
 ADX_MIN = 20
 VOL_SPIKE_MULT = 1.2
-BB_WIDTH_MAX = 0.06                      # BB width <= 6% of price
+BB_WIDTH_MAX = 0.1                      # BB width <= 6% of price
 
 # Candles
 CANDLE_LIMIT = 300  # enough for EMA200 on daily
