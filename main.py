@@ -397,7 +397,7 @@ def sheet_clear_data_rows():
         if dates:
             # Chuyển chuỗi ngày về datetime
             last_date_str = dates[-1]
-            last_date = datetime.strptime(last_date_str, "%Y-%m-%d")
+            last_date = datetime.strptime(last_date_str.strip(), "%Y-%m-%d %H:%M:%S")
             if datetime.now() - last_date < timedelta(days=1):
                 logging.info("❌ Dữ liệu chưa quá 1 ngày -> Không xoá")
                 return False
