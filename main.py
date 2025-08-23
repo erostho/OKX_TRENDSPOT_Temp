@@ -396,9 +396,9 @@ def sheet_clear_data_rows():
         dates = ws.col_values(4)[1:]  # bỏ dòng tiêu đề
         if dates:
             # Chuyển chuỗi ngày về datetime
-            last_date_str = dates[-1]
-            last_date = datetime.strptime(last_date_str.strip(), "%Y-%m-%d %H:%M:%S")
-            if datetime.now() - last_date < timedelta(days=1):
+            first_date_str = dates[0]
+            first_date = datetime.strptime(first_date_str.strip(), "%Y-%m-%d %H:%M:%S")
+            if datetime.now() - first_date < timedelta(days=1):
                 logging.info("❌ Dữ liệu chưa quá 1 ngày -> Không xoá")
                 return False
 
