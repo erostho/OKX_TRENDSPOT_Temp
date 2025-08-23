@@ -398,8 +398,8 @@ def sheet_clear_data_rows():
             # Chuyển chuỗi ngày về datetime
             first_date_str = dates[0]
             first_date = datetime.strptime(first_date_str.strip(), "%Y-%m-%d %H:%M:%S")
-            if datetime.now() - first_date < timedelta(days=1):
-                logging.info("❌ Dữ liệu chưa quá 1 ngày -> Không xoá")
+            if datetime.now() - first_date < timedelta(days=3):
+                logging.info("❌ Dữ liệu chưa quá 3 ngày -> Không xoá")
                 return False
 
         # Xóa dữ liệu nếu đã quá 1 ngày
