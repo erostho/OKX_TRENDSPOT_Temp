@@ -20,8 +20,8 @@ OKX_BASE_URL = "https://www.okx.com"
 TIMEFRAME = os.getenv("TIMEFRAME", "1D")
 MAX_COINS = int(os.getenv("MAX_COINS", "0")) or None
 MAX_USDT_PRICE = float(os.getenv("MAX_USDT_PRICE", "1.0"))
-MIN_24H_USDT_VOL = float(os.getenv("MIN_24H_USDT_VOL", "1000000"))
-TOP_N = int(os.getenv("TOP_N", "30"))
+MIN_24H_USDT_VOL = float(os.getenv("MIN_24H_USDT_VOL", "500000"))
+TOP_N = int(os.getenv("TOP_N", "50"))
 
 RELAX_MODE = int(os.getenv("RELAX_MODE", "1"))        # 1=RELAX, 0=STRICT
 TYPE_LABEL = "RELAX" if RELAX_MODE else "STRICT"
